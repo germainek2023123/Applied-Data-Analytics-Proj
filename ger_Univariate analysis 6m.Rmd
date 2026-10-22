@@ -1,0 +1,217 @@
+---
+title: "Applied_Data_analytics_Proj"
+output: html_document
+date: "2026-10-20"
+---
+**Research Qn:** Among hospitalised heart-failure patients who survive to 6 months, which characteristics differ between those who are readmitted and those who are not? 
+
+**Plan:** 
+1) load and clean data
+2) keep only 6-month survivors 
+3) pick admission-time variables 
+4) describe both groups side0by-side in a table 1 with p-values and SMDs
+5) run one crude log regression per variable to get odds ratios
+```{r packages}
+for (p in c("tableone")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+library(tableone)
+options(width = 200)
+library(tidyverse)
+```
+
+```{r}
+library(readr)
+heartdata <- read_csv("heart data.csv")
+heartdata <- heartdata[, !(names(heartdata) %in% c("x", "...1"))]
+dim(heartdata)
+```
+
+#restriction to 6-month survivors
+* **Why survivors only?** A patient who dies within 6 months cannot be "not readmitted" in the same sense as a survivor — death prevents readmission (a *competing risk*). The research question compares survivors who were readmitted with survivors who were not, so deaths within 6 months are removed.
+* **Outcome variable.** `re.admission.within.6.months` is coded 0/1. We turn it into a labelled factor so the table headings read "Not readmitted" / "Readmitted" instead of 0 / 1. The first level ("Not readmitted") becomes the reference group, so odds ratios later describe the odds of *being readmitted*.
+* **Data-quality check.** Five patients are recorded as alive at 6 months but with a discharge destination of "Died". The two fields contradict each other, so these records are excluded rather than guessed.
+```{r}
+surv <- subset(heartdata, death.within.6.months == 0 &
+                          !is.na(re.admission.within.6.months))
+
+bad  <- surv$DestinationDischarge == "Died"
+cat("Excluded (alive at 6 months but discharged 'Died'):", sum(bad), "\n")
+surv <- surv[!bad, ]
+
+surv$readmit6 <- factor(surv$re.admission.within.6.months, levels = c(0, 1),
+                        labels = c("Not readmitted", "Readmitted"))
+
+table(surv$readmit6)
+```
+#merge very small categories
+log regression needs enough patients in every category: with only a handful the odds ratio becomes huge or infinite, and the confidence interval is meaningless 
+```{r}
+age_map <- c("(21,29]" = "<70", "(29,39]" = "<70", "(39,49]" = "<70",
+             "(49,59]" = "<70", "(59,69]" = "<70", "(69,79]" = "70-79",
+             "(79,89]" = "80-89", "(89,110]" = "90+")
+surv$ageGroup <- factor(age_map[surv$ageCat],
+                        levels = c("<70", "70-79", "80-89", "90+"))
+
+surv$occupation[surv$occupation %in% c("Officer", "worker")] <- "Others"
+surv$admission.ward[surv$admission.ward == "ICU"] <- "Others"
+table(surv$ageGroup)
+```
+#choose the candidate variables 
+* We only include characteristics **known at admission** (demographics, heart-failure severity, comorbidities, vital signs, echo and blood tests). Outcome or follow-up variables (`death.*`, `re.admission.*`, `time.*`, `return.to.emergency.*`, `outcome.during.hospitalization`, `DestinationDischarge`) are left out because they are measured *after* the outcome starts — using them would be circular.
+* **Categorical** variables (`cat_vars`) are summarised as n (%) and compared with a chi-squared test. **Continuous** variables (`cont_vars`) are summarised as mean (SD) or median [IQR] and compared with a t-test or Wilcoxon test.
+* `CCI.score` (Charlson Comorbidity Index, 0–n) is treated as continuous because it is an ordered count.
+* Leukaemia (0 cases) and malignant lymphoma (1 case) are left out — nothing can be estimated.
+* `intersect()` keeps only names that exist in the file, and any misspelt name is printed, so a typo doesn't crash the script.
+```{r}
+cat_vars <- c(
+  # demographics / admission
+  "ageGroup", "gender", "occupation", "admission.way", "admission.ward",
+  # heart-failure severity
+  "type.of.heart.failure", "NYHA.cardiac.function.classification", "Killip.grade",
+  # comorbidities (0 = no, 1 = yes)
+  "myocardial.infarction", "congestive.heart.failure",
+  "peripheral.vascular.disease", "cerebrovascular.disease", "dementia",
+  "Chronic.obstructive.pulmonary.disease", "connective.tissue.disease",
+  "peptic.ulcer.disease", "diabetes",
+  "moderate.to.severe.chronic.kidney.disease", "hemiplegia",
+  "solid.tumor", "liver.disease", "acute.renal.failure",
+  "type.II.respiratory.failure")
+
+cont_vars <- c(
+  # comorbidity score, vitals, body size
+  "CCI.score", "visit.times", "body.temperature", "pulse", "respiration",
+  "systolic.blood.pressure", "diastolic.blood.pressure", "map",
+  "weight", "height", "BMI",
+  # echocardiogram
+  "LVEF",
+  # kidney function and electrolytes
+  "creatinine.enzymatic.method", "urea", "uric.acid",
+  "glomerular.filtration.rate", "cystatin", "sodium", "potassium", "chloride",
+  # blood count, inflammation, liver, cardiac markers
+  "white.blood.cell", "neutrophil.ratio", "lymphocyte.count", "hemoglobin",
+  "platelet", "D.dimer", "albumin", "total.bilirubin", "fibrinogen", "calcium",
+  "cholesterol", "glutamic.pyruvic.transaminase",
+  "glutamic.oxaloacetic.transaminase", "brain.natriuretic.peptide",
+  "high.sensitivity.troponin", "high.sensitivity.protein",
+  # length of stay (known only at discharge - see note in results)
+  "dischargeDay")
+
+setdiff(c(cat_vars, cont_vars), names(surv))   # names not found (should be empty)
+cat_vars  <- intersect(cat_vars,  names(surv))
+cont_vars <- intersect(cont_vars, names(surv))
+all_vars  <- c(cat_vars, cont_vars)
+```
+
+#set the correct variable types 
+categorical variables become factors 
+blank cells become NA (missing) -> not counted as separate category 
+relevel() makes farmer the reference occupation, so each other occupation i compared with farmers continuous variables are fored to be numeric
+```{r types}
+for (v in cat_vars) {
+  x <- surv[[v]]
+  x[x %in% c("", " ")] <- NA
+  surv[[v]] <- factor(x)
+}
+surv$occupation <- relevel(surv$occupation, ref = "farmer")
+for (v in cont_vars) surv[[v]] <- suppressWarnings(as.numeric(surv[[v]]))
+```
+
+#decide which continuous variables are skewed 
+**Reasoning.** Mean (SD) and the t-test assume roughly symmetric data. Many lab values (BNP, D-dimer, troponin, creatinine) are strongly right-skewed — a few very high values pull the mean up. For those, the **median [IQR]** and the **Wilcoxon rank-sum test** are more appropriate. A common rule of thumb is |skewness| > 1 = skewed.
+```{r}
+skew <- function(x) { x <- x[!is.na(x)]; mean((x - mean(x))^3) / sd(x)^3 }
+nonnormal_vars <- cont_vars[sapply(surv[cont_vars], function(x) abs(skew(x)) > 1)]
+nonnormal_vars
+```
+#table 1: survivors stratified by readmission
+* `CreateTableOne(..., strata = "readmit6")` splits patients into the two outcome groups and summarises every variable in each group.
+* **p-value** tests whether the groups differ (chi-squared for categories, t-test or Wilcoxon for numbers). Where a category has expected counts < 5, the chi-squared approximation is unreliable, so **Fisher's exact test** is used instead (`exact = sparse_vars`).
+* **SMD (standardised mean difference)** measures *how large* the difference is, independent of sample size. p-values shrink as samples get bigger, but SMD doesn't, so it is a fairer way to rank differences. **SMD ≥ 0.1** is the usual threshold for a meaningful difference.
+* `missing = TRUE` adds a % missing column, which tells us how reliable each comparison is.
+* `write.csv()` saves the table so it can be pasted into the report.
+```{r}
+sparse_vars <- cat_vars[sapply(cat_vars, function(v) {
+  tb <- table(surv[[v]], surv$readmit6)
+  any(suppressWarnings(chisq.test(tb))$expected < 5)
+})]
+
+tab1 <- CreateTableOne(vars = all_vars, strata = "readmit6",
+                       data = surv, factorVars = cat_vars, test = TRUE)
+
+tab1_print <- print(tab1,
+                    nonnormal = nonnormal_vars,
+                    exact     = sparse_vars,
+                    smd       = TRUE,
+                    missing   = TRUE,
+                    noSpaces  = TRUE)
+
+write.csv(tab1_print, "Table1_readmission_6m.csv")
+```
+#variables with a meaningful difference (SMD >= 0.1)
+gives a quick shortlist of characteristics that differ most between readmitted and non-readmitted survivors
+```{r}
+smd_vals <- ExtractSmd(tab1)
+smd_df   <- data.frame(variable = rownames(smd_vals),
+                       SMD = round(as.numeric(smd_vals[, 1]), 3))
+smd_df   <- smd_df[order(-smd_df$SMD), ]
+print(smd_df[smd_df$SMD >= 0.1, ], row.names = FALSE)
+```
+
+#Univariate (crude) logistic regression 
+* table 1 shows *whether* groups differ; logistic regression puts the differences on an **OR** scale -> multivariable model will use later 
+For each variable we fit `glm(readmit6 ~ variable, family = binomial)`, one variable at a time. That is what "univariate" (crude, unadjusted) means.
+* **OR = exp(coefficient).** OR > 1 means higher odds of readmission; OR < 1 means higher odds of surviving 6 months *without* readmission.
+* **Continuous variables are standardised** (`scale()`) so the OR is *per 1 SD increase*. That makes ORs comparable across variables in very different units (e.g. sodium in mmol/L vs BNP in pg/mL).
+* **95% CI** = exp(coefficient ± 1.96 × SE). If it does not cross 1, the association is significant at the 5% level.
+* **Two p-values.** `p_wald` tests each category against the reference. `p_overall` (likelihood-ratio test) tests the variable *as a whole*, which is the right test for variables with 3+ categories such as NYHA class.
+* Categorical variables with fewer than 5 patients in any cell are skipped (estimates would be unstable); their Fisher p-value is still in Table 1.
+```{r} 
+uni_rows <- list()
+for (v in all_vars) {
+  d <- surv[!is.na(surv[[v]]), c("readmit6", v)]
+
+  if (v %in% cont_vars) {
+    d$x <- as.numeric(scale(d[[v]]))               # per 1 SD
+    lab <- paste0(v, " (per 1 SD)")
+  } else {
+    d$x <- droplevels(d[[v]])
+    if (nlevels(d$x) < 2) next
+    if (min(table(d$x, d$readmit6)) < 5) {
+      cat("Skipped (cell < 5):", v, "\n"); next
+    }
+  }
+
+  m     <- glm(readmit6 ~ x, data = d, family = binomial)
+  cf    <- summary(m)$coefficients[-1, , drop = FALSE]
+  ci    <- confint.default(m)[-1, , drop = FALSE]
+  p_lrt <- anova(m, test = "LRT")[2, "Pr(>Chi)"]
+
+  terms <- if (v %in% cont_vars) lab else
+    paste0(v, ": ", sub("^x", "", rownames(cf)), " vs ", levels(d$x)[1])
+
+  uni_rows[[v]] <- data.frame(
+    variable  = terms,
+    n         = nrow(d),
+    OR        = round(exp(cf[, 1]), 2),
+    CI_95     = sprintf("%.2f-%.2f", exp(ci[, 1]), exp(ci[, 2])),
+    p_wald    = signif(cf[, 4], 3),
+    p_overall = c(signif(p_lrt, 3), rep(NA, nrow(cf) - 1)),
+    row.names = NULL)
+}
+uni <- do.call(rbind, uni_rows); rownames(uni) <- NULL
+
+uni_show <- uni
+uni_show$p_wald    <- format.pval(uni$p_wald, digits = 2, eps = 0.001)
+uni_show$p_overall <- ifelse(is.na(uni$p_overall), "",
+                             format.pval(uni$p_overall, digits = 2, eps = 0.001))
+print(uni_show, row.names = FALSE, right = FALSE)
+
+write.csv(uni, "Univariate_logistic_readmission_6m.csv", row.names = FALSE)
+```
+#shortlist for the multivariable model 
+
+```{r}
+sig <- uni$variable[!is.na(uni$p_overall) & uni$p_overall < 0.05]
+unique(sub(":.*| \\(per.*", "", sig))
+```
